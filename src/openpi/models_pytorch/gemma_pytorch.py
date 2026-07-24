@@ -2,6 +2,7 @@ from typing import Literal
 
 import torch
 from torch import nn
+import torch.nn.functional as F  # noqa: N812
 from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
@@ -38,6 +39,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
+        vlm_config_hf.vision_config._attn_implementation = "sdpa"  # noqa: SLF001
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
@@ -125,6 +127,8 @@ class PaliGemmaWithExpertModel(nn.Module):
         else:
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
+            if attention_mask is not None and attention_mask.dtype not in (torch.bool, inputs_embeds[0].dtype):
+                attention_mask = attention_mask.to(dtype=inputs_embeds[0].dtype)
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
@@ -132,13 +136,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                 and self.gemma_expert.model.gradient_checkpointing
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
-            # Force enable gradient checkpointing if we're in training mode and the model supports it
-            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                if not self.gemma_expert.model.gradient_checkpointing:
-                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
-                    self.gemma_expert.model.gradient_checkpointing = True
-                use_gradient_checkpointing = True
 
             # Debug gradient checkpointing status
             if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
@@ -196,15 +193,18 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                # Prefix and suffix share one attention operation after their Q/K/V states are concatenated.
+                att_output = F.scaled_dot_product_attention(
                     query_states,
                     key_states,
                     value_states,
-                    attention_mask,
-                    scaling,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=scaling,
+                    enable_gqa=query_states.shape[1] != key_states.shape[1],
                 )
+                att_output = att_output.transpose(1, 2).contiguous()
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -222,7 +222,7 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                     # first residual
                     out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-                    after_first_residual = out_emb.clone()
+                    after_first_residual = out_emb
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
                     # Convert to bfloat16 if the next layer (mlp) uses bfloat16
                     if layer.mlp.up_proj.weight.dtype == torch.bfloat16:

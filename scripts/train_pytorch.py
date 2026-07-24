@@ -23,10 +23,12 @@ Multi-Node Training:
 
 """
 
+import contextlib
 import dataclasses
 import gc
 import logging
 import os
+import pathlib
 import platform
 import shutil
 import time
@@ -38,6 +40,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.parallel
 import tqdm
+from transformers.modeling_utils import no_init_weights
 import wandb
 
 import openpi.models.pi0_config
@@ -45,6 +48,31 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+
+
+TRACE_STEP_ENV = "OPENPI_TRACE_STEP"
+GRADIENT_CHECKPOINTING_ENV = "OPENPI_GRADIENT_CHECKPOINTING"
+GRADIENT_CHECKPOINTING_AUTO_LOCAL_BATCH = 32
+
+
+def get_gradient_checkpointing_mode(local_batch_size: int) -> str:
+    mode = os.environ.get(GRADIENT_CHECKPOINTING_ENV, "auto").strip().lower()
+    truthy = {"1", "true", "yes", "on", "enable", "enabled"}
+    falsy = {"0", "false", "no", "off", "disable", "disabled", "none"}
+
+    if mode in truthy:
+        return "transformer"
+    if mode in falsy:
+        return "off"
+    if mode == "auto":
+        return "transformer" if local_batch_size >= GRADIENT_CHECKPOINTING_AUTO_LOCAL_BATCH else "off"
+    if mode in {"transformer", "gemma", "vision", "full"}:
+        return mode
+
+    raise ValueError(
+        f"Invalid {GRADIENT_CHECKPOINTING_ENV}={mode!r}. "
+        "Use auto, off, transformer, gemma, vision, full, true, or false."
+    )
 
 
 def init_logging():
@@ -94,18 +122,18 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
-    if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
-
-        # Set up debugging environment variables for DDP issues
-        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
-            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
+
+    if use_ddp and not torch.distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
+            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+        init_kwargs = {"device_id": device} if backend == "nccl" else {}
+        torch.distributed.init_process_group(backend=backend, init_method="env://", **init_kwargs)
+
     return use_ddp, local_rank, device
 
 
@@ -120,6 +148,54 @@ def set_seed(seed: int, local_rank: int):
     np.random.seed(seed + local_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed + local_rank)
+
+
+def get_trace_step() -> int | None:
+    value = os.environ.get(TRACE_STEP_ENV)
+    if value is None:
+        return None
+
+    try:
+        trace_step = int(value)
+    except ValueError as error:
+        raise ValueError(f"{TRACE_STEP_ENV} must be a non-negative integer, got {value!r}") from error
+    if trace_step < 0:
+        raise ValueError(f"{TRACE_STEP_ENV} must be a non-negative integer, got {value!r}")
+    return trace_step
+
+
+def _copy_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous().clone()
+    if isinstance(value, dict):
+        return {key: _copy_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_to_cpu(item) for item in value)
+    return value
+
+
+def dump_first_step_batch(config: _config.TrainConfig, observation, actions) -> pathlib.Path:
+    output_path = pathlib.Path(config.first_step_dump_path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    snapshot = {
+        "observation": _copy_to_cpu(observation.to_dict()),
+        "actions": _copy_to_cpu(actions),
+    }
+
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    torch.save(snapshot, temporary_path)
+    temporary_path.replace(output_path)
+    return output_path
+
+
+def load_first_step_batch(config: _config.TrainConfig, observation):
+    input_path = pathlib.Path(config.first_step_load_path).expanduser().resolve()
+    snapshot = torch.load(input_path, map_location="cpu", weights_only=False)
+    loaded_observation = type(observation).from_dict(snapshot["observation"])
+    return loaded_observation, snapshot["actions"], input_path
 
 
 def build_datasets(config: _config.TrainConfig):
@@ -310,37 +386,41 @@ def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+    trace_step = get_trace_step()
+    if trace_step is not None and is_main:
+        logging.info(f"Tracing training step {trace_step}; configured by {TRACE_STEP_ENV}")
 
     # Initialize checkpoint directory and wandb
-    resuming = False
-    if config.resume:
-        # Find checkpoint directory based on experiment name
-        exp_checkpoint_dir = config.checkpoint_dir
-        if exp_checkpoint_dir.exists():
-            # Use validation to find the latest working checkpoint
-            latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
-            if latest_step is not None:
-                resuming = True
-                logging.info(
-                    f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
-                )
+    resuming = config.resume
+    if is_main:
+        if resuming:
+            # Find checkpoint directory based on experiment name
+            exp_checkpoint_dir = config.checkpoint_dir
+            if exp_checkpoint_dir.exists():
+                # Use validation to find the latest working checkpoint
+                latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
+                if latest_step is not None:
+                    logging.info(
+                        f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
+                    )
+                else:
+                    raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
             else:
-                raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
+                raise FileNotFoundError(
+                    f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume"
+                )
         else:
-            raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+            if config.overwrite and config.checkpoint_dir.exists():
+                shutil.rmtree(config.checkpoint_dir)
+                logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
-    # Create checkpoint directory with experiment name
-    if not resuming:
-        # For new runs, create experiment-specific checkpoint directory
-        exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-    else:
-        # For resume, checkpoint_dir is already set to the experiment directory
-        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+            # Create checkpoint directory with experiment name
+            exp_checkpoint_dir = config.checkpoint_dir
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Initialize wandb (only on main process)
     if is_main:
@@ -406,15 +486,41 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    model_path = None
+    if config.pytorch_weight_path is not None:
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"PyTorch checkpoint not found: {model_path}")
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
-        model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
+    if model_path is not None:
+        with no_init_weights():
+            model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
+        model.paligemma_with_expert.paligemma.tie_weights()
+
+        model = model.to(device)
+
+        logging.info(f"Loading weights from: {model_path}")
+        safetensors.torch.load_model(model, model_path, strict=True)
+        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
     else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
+        model = model.to(device)
+
+    gradient_checkpointing_mode = get_gradient_checkpointing_mode(effective_batch_size)
+    if gradient_checkpointing_mode == "off":
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+        logging.info("Gradient checkpointing is disabled; activations will not be recomputed during backward")
+    else:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable(mode=gradient_checkpointing_mode)
+        logging.info(
+            "Gradient checkpointing mode=%s (%s=%s, local_batch_size=%d)",
+            gradient_checkpointing_mode,
+            GRADIENT_CHECKPOINTING_ENV,
+            os.environ.get(GRADIENT_CHECKPOINTING_ENV, "auto"),
+            effective_batch_size,
+        )
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
@@ -437,16 +543,6 @@ def train_loop(config: _config.TrainConfig):
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
-
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -489,7 +585,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
         )
-        logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
+        logging.info(f"Memory optimizations: gradient_checkpointing={gradient_checkpointing_mode}")
         logging.info(
             f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
         )
@@ -516,44 +612,76 @@ def train_loop(config: _config.TrainConfig):
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            # First-step batch dump/load is temporarily disabled.
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+            should_trace = trace_step is not None and global_step == trace_step
+            step_profiler = None
+            if should_trace:
+                profiler_activities = [torch.profiler.ProfilerActivity.CPU]
+                if device.type == "cuda":
+                    profiler_activities.append(torch.profiler.ProfilerActivity.CUDA)
+                step_profiler = torch.profiler.profile(
+                    activities=profiler_activities,
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            profile_context = step_profiler if step_profiler is not None else contextlib.nullcontext()
+            trace_region = torch.profiler.record_function if should_trace else contextlib.nullcontext
+            with profile_context:
+                # The unified data loader returns (observation, actions) tuple
+                with trace_region("train_step/data_to_device"):
+                    observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+                    actions = actions.to(torch.float32)  # noqa: PLW2901
+                    actions = actions.to(device)  # noqa: PLW2901
 
-            loss = losses.mean()
+                # Update LR
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_schedule(global_step)
 
-            # Backward pass
-            loss.backward()
+                # Forward pass
+                with trace_region("train_step/forward"):
+                    losses = model(observation, actions)
+                    # Ensure losses is a tensor and handle different return types
+                    if isinstance(losses, list | tuple):
+                        losses = torch.stack(losses)
+                    elif not isinstance(losses, torch.Tensor):
+                        losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            # Log memory usage after backward pass
-            if global_step < 5 and is_main and torch.cuda.is_available():
-                log_memory_usage(device, global_step, "after_backward")
+                    loss = losses.mean()
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+                # Backward pass
+                with trace_region("train_step/backward"):
+                    loss.backward()
 
-            # Optimizer step
-            optim.step()
-            optim.zero_grad(set_to_none=True)
+                # Log memory usage after backward pass
+                if global_step < 5 and is_main and torch.cuda.is_available():
+                    log_memory_usage(device, global_step, "after_backward")
 
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+                # Gradient clipping
+                with trace_region("train_step/gradient_clipping"):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=config.optimizer.clip_gradient_norm
+                    )
+
+                # Optimizer step
+                with trace_region("train_step/optimizer"):
+                    optim.step()
+                    optim.zero_grad(set_to_none=True)
+
+                    # Clear gradients more aggressively
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            param.grad.detach_()
+                            param.grad = None
+
+            if step_profiler is not None:
+                trace_dir = config.checkpoint_dir / "traces"
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                trace_path = trace_dir / f"step_{trace_step}_rank_{local_rank}.json"
+                step_profiler.export_chrome_trace(str(trace_path))
+                logging.info(f"Exported step {trace_step} trace to {trace_path}")
 
             # Collect stats
             if is_main:

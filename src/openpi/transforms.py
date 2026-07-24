@@ -60,6 +60,30 @@ class Group:
 
 
 @dataclasses.dataclass(frozen=True)
+class DropImages(DataTransformFn):
+    """Remove image views before model preprocessing.
+
+    This is useful for validated, task-specific camera ablations. The model must
+    support a variable number of image views when this transform is enabled.
+    """
+
+    image_keys: Sequence[str]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not self.image_keys:
+            return data
+        images = data.get("image")
+        if images is None:
+            return data
+        masks = data.get("image_mask", {})
+        data["image"] = {key: value for key, value in images.items() if key not in self.image_keys}
+        data["image_mask"] = {key: value for key, value in masks.items() if key not in self.image_keys}
+        if not data["image"]:
+            raise ValueError("DropImages removed every image view")
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class CompositeTransform(DataTransformFn):
     """A composite transform that applies a sequence of transforms in order."""
 

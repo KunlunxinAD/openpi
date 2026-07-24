@@ -21,13 +21,19 @@ def preprocess_observation_pytorch(
     observation,
     *,
     train: bool = False,
-    image_keys: Sequence[str] = IMAGE_KEYS,
+    image_keys: Sequence[str] | None = None,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
 ):
     """Torch.compile-compatible version of preprocess_observation_pytorch with simplified type annotations.
 
     This function avoids complex type annotations that can cause torch.compile issues.
     """
+    if image_keys is None:
+        # Image pruning is represented by removing keys from Observation. Keep
+        # the dataset/model ordering while accepting any non-empty subset.
+        image_keys = tuple(observation.images.keys())
+    if not image_keys:
+        raise ValueError("At least one image view is required")
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 

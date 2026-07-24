@@ -112,8 +112,9 @@ class PI0Pytorch(nn.Module):
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
 
-        # Initialize gradient checkpointing flag
+        # Initialize gradient checkpointing flags.
         self.gradient_checkpointing_enabled = False
+        self.gradient_checkpointing_mode = "off"
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
@@ -124,20 +125,44 @@ class PI0Pytorch(nn.Module):
         except ImportError:
             raise ValueError(msg) from None
 
-    def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory optimization."""
-        self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+    def gradient_checkpointing_enable(self, mode: str = "transformer"):
+        """Enable gradient checkpointing for memory optimization.
 
-        logging.info("Enabled gradient checkpointing for PI0Pytorch model")
+        Modes:
+          - transformer: checkpoint SigLIP vision tower and joint Gemma transformer layers.
+          - gemma: checkpoint the joint Gemma transformer layers only.
+          - vision: checkpoint the SigLIP vision tower only.
+          - full: also checkpoint the small embedding/projection wrappers in this module.
+        """
+        if mode not in {"transformer", "gemma", "vision", "full"}:
+            raise ValueError(f"Unsupported gradient checkpointing mode: {mode}")
+        self.gradient_checkpointing_enabled = True
+        self.gradient_checkpointing_mode = mode
+        checkpoint_gemma = mode in {"transformer", "gemma", "full"}
+        checkpoint_vision = mode in {"transformer", "vision", "full"}
+        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = checkpoint_gemma
+        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = checkpoint_vision
+        if hasattr(self.paligemma_with_expert.paligemma.vision_tower, "vision_model"):
+            self.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.gradient_checkpointing = (
+                checkpoint_vision
+            )
+        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = checkpoint_gemma
+
+        logging.info(
+            "Enabled gradient checkpointing for PI0Pytorch model: mode=%s gemma=%s vision=%s",
+            mode,
+            checkpoint_gemma,
+            checkpoint_vision,
+        )
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
+        self.gradient_checkpointing_mode = "off"
         self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
         self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        if hasattr(self.paligemma_with_expert.paligemma.vision_tower, "vision_model"):
+            self.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
@@ -148,7 +173,7 @@ class PI0Pytorch(nn.Module):
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
-        if self.gradient_checkpointing_enabled and self.training:
+        if self.gradient_checkpointing_mode == "full" and self.training:
             return torch.utils.checkpoint.checkpoint(
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
             )
@@ -161,7 +186,11 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation,
+            train=train,
+            image_keys=tuple(observation.images.keys()),
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

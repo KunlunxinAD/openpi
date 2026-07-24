@@ -97,6 +97,11 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Performance experiments. Dynamic padding is applied at batch collation;
+    # image pruning is applied after dataset transforms and before collation.
+    dynamic_padding: bool = False
+    drop_image_keys: Sequence[str] = ()
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -502,6 +507,10 @@ class TrainConfig:
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
+    # If set, dump the first transformed batch before it is moved to the training device.
+    first_step_dump_path: str | None = None
+    # If set, replace the first data-loader batch with a previously dumped batch.
+    first_step_load_path: str | None = None
     # Global batch size.
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
@@ -554,6 +563,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.first_step_dump_path is not None and self.first_step_load_path is not None:
+            raise ValueError("Cannot dump and load the first-step batch in the same run.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -742,9 +753,14 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="gs://openpi-assets/checkpoints/pi05_libero/assets"),
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -758,8 +774,34 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="/workspace/models/openpi_data/openpi-assets/checkpoints/pi05_base_pytorch",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_smoke",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir="gs://openpi-assets/checkpoints/pi05_libero/assets"),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=1,
+        num_workers=0,
+        num_train_steps=2,
+        log_interval=1,
+        save_interval=1,
+        keep_period=None,
+        ema_decay=None,
+        pytorch_weight_path="/workspace/models/openpi_data/openpi-assets/checkpoints/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        overwrite=True,
+        exp_name="xpu_2step",
+        wandb_enabled=False,
     ),
     #
     # Fine-tuning Aloha configs.

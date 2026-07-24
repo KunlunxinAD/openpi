@@ -605,11 +605,28 @@ class SiglipEncoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
-            layer_outputs = encoder_layer(
-                hidden_states,
-                attention_mask,
-                output_attentions=output_attentions,
-            )
+            if self.gradient_checkpointing and self.training:
+
+                def layer_forward(hidden_states, attention_mask):
+                    return encoder_layer(
+                        hidden_states,
+                        attention_mask,
+                        output_attentions=output_attentions,
+                    )
+
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    layer_forward,
+                    hidden_states,
+                    attention_mask,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                    attention_mask,
+                    output_attentions=output_attentions,
+                )
 
             hidden_states = layer_outputs[0]
 

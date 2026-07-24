@@ -1,4 +1,6 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
+import functools
 import logging
 import multiprocessing
 import os
@@ -180,11 +182,17 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
+    input_transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+    ]
+    if data_config.drop_image_keys:
+        input_transforms.append(_transforms.DropImages(data_config.drop_image_keys))
+
     return TransformedDataset(
         dataset,
         [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
+            *input_transforms,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
@@ -208,11 +216,17 @@ def transform_iterable_dataset(
             )
         norm_stats = data_config.norm_stats
 
+    input_transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+    ]
+    if data_config.drop_image_keys:
+        input_transforms.append(_transforms.DropImages(data_config.drop_image_keys))
+
     return IterableTransformedDataset(
         dataset,
         [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
+            *input_transforms,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
@@ -240,6 +254,23 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    dynamic_padding = os.environ.get("XVLA_DYNAMIC_PADDING", "").strip().lower() in {
+        "1", "true", "yes", "on", "enable", "enabled"
+    }
+    drop_image_keys = tuple(
+        key.strip() for key in os.environ.get("XVLA_DROP_IMAGE_KEYS", "").split(",") if key.strip()
+    )
+    if dynamic_padding or drop_image_keys:
+        data_config = dataclasses.replace(
+            data_config,
+            dynamic_padding=data_config.dynamic_padding or dynamic_padding,
+            drop_image_keys=(*data_config.drop_image_keys, *drop_image_keys),
+        )
+        logging.info(
+            "Input efficiency experiments: dynamic_padding=%s, drop_image_keys=%s",
+            data_config.dynamic_padding,
+            data_config.drop_image_keys,
+        )
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
@@ -332,6 +363,7 @@ def create_torch_data_loader(
         num_workers=num_workers,
         seed=seed,
         framework=framework,
+        dynamic_padding=data_config.dynamic_padding,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -393,6 +425,7 @@ class TorchDataLoader:
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        dynamic_padding: bool = False,
     ):
         """Create a PyTorch data loader.
 
@@ -439,7 +472,7 @@ class TorchDataLoader:
             num_workers=num_workers,
             multiprocessing_context=mp_context,
             persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
+            collate_fn=functools.partial(_collate_fn, dynamic_padding=dynamic_padding),
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
@@ -468,11 +501,24 @@ class TorchDataLoader:
                     yield jax.tree.map(torch.as_tensor, batch)
 
 
-def _collate_fn(items):
+def _collate_fn(items, *, dynamic_padding: bool = False):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    batch = jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    if not dynamic_padding:
+        return batch
+
+    token_mask = batch.get("tokenized_prompt_mask")
+    if token_mask is None:
+        return batch
+    valid_lengths = np.asarray(token_mask, dtype=np.bool_).sum(axis=-1)
+    max_length = max(1, int(valid_lengths.max()))
+    for key in ("tokenized_prompt", "tokenized_prompt_mask", "token_ar_mask", "token_loss_mask"):
+        value = batch.get(key)
+        if value is not None and np.asarray(value).ndim >= 2:
+            batch[key] = value[:, :max_length]
+    return batch
 
 
 def _worker_init_fn(worker_id: int) -> None:
