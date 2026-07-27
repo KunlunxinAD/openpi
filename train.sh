@@ -24,6 +24,18 @@ EXP_NAME="${EXP_NAME:-pi05_libero_xpu_8card_input_opt}"
 ASSETS_DIR="${ASSETS_DIR:-gs://openpi-assets/checkpoints/pi05_libero/assets}"
 WANDB_ENABLED="${WANDB_ENABLED:-0}"
 OVERWRITE="${OVERWRITE:-0}"
+# XPU optimizations.
+export XMLIR_BMM_DISPATCH_VALUE=2
+export XMLIR_ENABLE_LINEAR_FC_FUSION=1
+export BKCL_PCIE_TOPO=1
+export XMLIR_ENABLE_FAST_FC=1
+unset CUDA_LAUNCH_BLOCKING
+unset COPY2D_SDNN
+export XDNN_USE_FAST_GELU=1
+export XPYTORCH_RUN_ENHANCE=1
+export XDNN_USE_FAST_SWISH=1
+export XDNN_FAST_DIV_SCALAR=true
+export XPUAPI_SDNN_BF16_ROUND_MODE=3
 
 args=(
   pi05_libero
